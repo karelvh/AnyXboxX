@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import struct
@@ -24,6 +25,24 @@ CALL_SITE = re.compile(
     r'call\b[^@\n]*@(?:"([^"]+)"|([\w.$-]+))\s*\('
 )
 DECLARATION = re.compile(r'^declare\b[^@\n]*@(?:"([^"]+)"|([\w.$-]+))\s*\(')
+# A call instruction, with the optional assigned name and the tail/musttail/notail modifier.
+# No leading block label is matched: `dxc -dumpbin` prints a basic block as a `; <label>:N`
+# comment line of its own and never prefixes an instruction with one, so a label cannot appear in
+# front of a call in this input (0 such lines in the disassembly of the source-built fixtures).
+CALL_INSTRUCTION = re.compile(
+    r'^\s*(?:%(?:"[^"]+"|[\w.$-]+)\s*=\s*)?(?:(?:musttail|tail|notail)\s+)?call\b')
+# Every @ symbol on a line: the callee of a direct or bitcast-spelled call is the first one that
+# appears before the operand list, and any other xbox.* symbol is a reference to the same effect.
+CALLEE = re.compile(r'@(?:"([^"]+)"|([\w.$-]+))')
+ALIAS_DEFINITION = re.compile(r'^@(?:"[^"]+"|[\w.$-]+)\s*=\s*alias\b')
+STORE_INSTRUCTION = re.compile(r'^(?:%[^\s=]+\s*=\s*)?store\b')
+BITCAST_USE = re.compile(r'\bbitcast\b')
+GLOBAL_INITIALIZER = re.compile(
+    r'^@(?:"[^"]+"|[\w.$-]+)\s*=\s*(?:global|constant|externally_initialized)\b')
+# Debug intrinsics take metadata operands that the runtime never reads, so an xbox.* symbol that
+# only appears inside one of these calls is not an executable use. Only the callee decides: a line
+# that merely mentions a debug intrinsic somewhere else is still an executable call.
+DEBUG_INTRINSIC = re.compile(r'llvm\.dbg\.(?:value|declare|assign|label)\b')
 XBOX_SYMBOL = re.compile(r"xbox\.[\w.$-]+")
 METADATA_STRING = re.compile(r'!"([^"]*)"')
 
@@ -43,36 +62,111 @@ def strip_comment(line):
     return line
 
 
+def reference_kind(line):
+    """Name the executable form of a non-call xbox.* reference.
+
+    A call to a debug intrinsic is not executable use and is labelled `debug-only` by
+    `classify_line()` instead, so this helper never sees it.
+    """
+    if ALIAS_DEFINITION.match(line):
+        return "alias"
+    if STORE_INSTRUCTION.match(line):
+        return "store"
+    if BITCAST_USE.search(line):
+        return "bitcast"
+    if GLOBAL_INITIALIZER.match(line):
+        return "global-initializer"
+    return "operand"
+
+
+def call_operand_paren(line):
+    """Index of the call's operand list, which is the last top-level '('.
+
+    Everything before it is the callee expression, so an xbox.* symbol there is the callee of a
+    direct or bitcast-spelled call; a symbol after it is an operand of that call.
+    """
+    depth, position = 0, -1
+    for index, char in enumerate(line):
+        if char == "(":
+            if depth == 0:
+                position = index
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+    return position
+
+
+def classify_line(line, calls, declarations, references):
+    """Sort one non-metadata line into a declaration, a call site, or a reference."""
+    if line.startswith("declare"):
+        declaration = DECLARATION.match(line)
+        if declaration:
+            symbol = declaration[1] or declaration[2]
+            if symbol.startswith(XBOX_PREFIX):
+                declarations.add(symbol)
+        return
+    is_call = CALL_INSTRUCTION.match(line) is not None
+    operands_at = call_operand_paren(line) if is_call else -1
+    callee_at = None
+    if is_call:
+        for match in CALLEE.finditer(line):
+            if operands_at < 0 or match.start() < operands_at:
+                callee_at = match.start()
+                callee_name = match.group(1) or match.group(2)
+                break
+    debug_call = callee_at is not None and DEBUG_INTRINSIC.match(callee_name) is not None
+    for match in CALLEE.finditer(line):
+        symbol = match.group(1) or match.group(2)
+        if not symbol.startswith(XBOX_PREFIX):
+            continue
+        if match.start() == callee_at:
+            calls[symbol] += 1
+            continue
+        if debug_call:
+            kind = "debug-only"
+        elif is_call:
+            kind = "call-operand"
+        else:
+            kind = reference_kind(line)
+        entry = references.setdefault(symbol, {"sites": 0, "debug_sites": 0, "kinds": set()})
+        # sites counts executable uses only; debug-only uses are counted apart.
+        if kind == "debug-only":
+            entry["debug_sites"] += 1
+        else:
+            entry["sites"] += 1
+        entry["kinds"].add(kind)
+
+
 def xbox_intrinsic_inventory(text):
     """Classify xbox.* intrinsic names in the disassembler's textual IR.
 
-    A call is an instruction that references the symbol; a declaration is only
-    the function table entry; a name carried by a metadata string value is
-    metadata-only. An unused declaration, or a name that metadata alone
-    mentions, is therefore never reported as a call. A named-metadata key such
-    as !xbox.compiler.options names a node, not an intrinsic, and is never counted.
+    A call is an instruction whose callee is the symbol; a declaration is only the function table
+    entry; a name carried by a metadata string value is metadata-only. An unused declaration, or a
+    name that metadata alone mentions, is therefore never reported as a call. A named-metadata key
+    such as !xbox.compiler.options names a node, not an intrinsic, and is never counted.
+
+    `references` covers every other way the module keeps a symbol reachable: an alias, a stored
+    pointer, a bitcast, a global initializer or a call operand. Those forms are not calls, but they
+    reach the same builtin once the module runs, so they are reported with their kind.
     """
-    declarations, calls, metadata_names = set(), Counter(), set()
+    declarations, calls, metadata_names, references = set(), Counter(), set(), {}
     for raw in text.splitlines():
         line = strip_comment(raw).strip()
         if not line:
             continue
-        if line.startswith("declare"):
-            declaration = DECLARATION.match(line)
-            if declaration:
-                symbol = declaration[1] or declaration[2]
-                if symbol.startswith(XBOX_PREFIX):
-                    declarations.add(symbol)
-            continue
-        call = CALL_SITE.search(line)
-        if call:
-            symbol = call[1] or call[2]
-            if symbol.startswith(XBOX_PREFIX):
-                calls[symbol] += 1
+        if not line.startswith("!"):
+            classify_line(line, calls, declarations, references)
         for value in METADATA_STRING.findall(line):
             metadata_names.update(XBOX_SYMBOL.findall(value))
-    return dict(calls=dict(sorted(calls.items())), declarations=sorted(declarations),
-                metadata_only=sorted(metadata_names - declarations - set(calls)))
+    return dict(
+        calls=dict(sorted(calls.items())),
+        declarations=sorted(declarations),
+        metadata_only=sorted(metadata_names - declarations - set(calls) - set(references)),
+        references={symbol: {"sites": item["sites"],
+                              "debug_sites": item["debug_sites"],
+                              "kinds": sorted(item["kinds"])}
+                    for symbol, item in sorted(references.items())},
+    )
 
 
 def packing_evidence(text):
@@ -218,44 +312,72 @@ def measure(build, inventory, probe, fixtures):
     return result
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("build", type=Path)
     p.add_argument("--inventory", type=Path, default=PROJECT / "out/calls/six-apis.json")
     p.add_argument("--probe", type=Path, default=PROJECT / "out/build/dev/root_probe.exe")
     p.add_argument("--controls", type=Path, help="Build directory with compute_root.cso and compute_tables.cso")
-    args = p.parse_args()
-    dest = PROJECT / "out/calls/desktop-roots.json"
-    build = args.build.resolve(strict=True)
-    if dest.resolve().is_relative_to(build) or dest.resolve() == args.inventory.resolve():
-        p.error("Report destination overlaps inputs")
-    fixtures = {}
-    control_checks = {}
-    probe = args.probe.resolve(strict=True)
-    if args.controls:
-        for name in ("compute_root", "compute_tables"):
-            blob = (args.controls / (name + ".cso")).read_bytes()
-            sections = parts(blob)
-            fixtures[name] = sections[b"RTS0"]
-            checks = validate_shader(probe, blob, sections[b"DXIL"])
-            if any(checks[k]["status"] != "0x00000000" for k in ("container", "module")):
-                raise ValueError(f"Desktop positive control failed for {name}")
-            control_checks[name] = checks
-    inventory_data = args.inventory.read_bytes()
-    result = measure(build, json.loads(inventory_data), probe, fixtures)
-    document = dict(schema=1, windows_build=sys.getwindowsversion().build,
-                    probe_sha256=hashlib.sha256(probe.read_bytes()).hexdigest(),
-                    inventory_sha256=hashlib.sha256(inventory_data).hexdigest(),
-                    control_root_sha256={key: hashlib.sha256(b).hexdigest() for key, b in fixtures.items()},
-                    control_validation=control_checks, images=result)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(mode="w", dir=dest.parent, delete=False, encoding="utf-8") as f:
-        json.dump(document, f, indent=2)
-        f.write("\n")
-    Path(f.name).replace(dest)
+    p.add_argument("--output", type=Path, default=PROJECT / "out/calls/desktop-roots.json")
+    args = p.parse_args(argv)
+    try:
+        build = args.build.resolve(strict=True)
+        if not build.is_dir():
+            raise ValueError(f"Build path is not a directory: {build}")
+        probe = args.probe.resolve(strict=True)
+        if not probe.is_file():
+            raise ValueError(f"Probe path is not a file: {probe}")
+        controls = args.controls.resolve() if args.controls is not None else None
+        inventory_path = args.inventory.resolve()
+        dest = args.output.resolve()
+    except (OSError, ValueError) as exc:
+        p.exit(1, f"probe_roots: {exc}\n")
+
+    if (dest.is_relative_to(build) or dest == probe or dest == inventory_path or
+            (controls is not None and dest.is_relative_to(controls)) or
+            dest.is_dir()):
+        p.error("Report destination overlaps inputs or is a directory")
+
+    try:
+        fixtures = {}
+        control_checks = {}
+        if controls is not None:
+            for name in ("compute_root", "compute_tables"):
+                blob = (controls / (name + ".cso")).read_bytes()
+                sections = parts(blob)
+                fixtures[name] = sections[b"RTS0"]
+                checks = validate_shader(probe, blob, sections[b"DXIL"])
+                if any(checks[k]["status"] != "0x00000000" for k in ("container", "module")):
+                    raise ValueError(f"Desktop positive control failed for {name}")
+                control_checks[name] = checks
+        inventory_data = inventory_path.read_bytes()
+        result = measure(build, json.loads(inventory_data), probe, fixtures)
+        windows_build = sys.getwindowsversion().build if hasattr(sys, "getwindowsversion") else None
+        document = dict(schema=1, windows_build=windows_build,
+                        probe_sha256=hashlib.sha256(probe.read_bytes()).hexdigest(),
+                        inventory_sha256=hashlib.sha256(inventory_data).hexdigest(),
+                        control_root_sha256={key: hashlib.sha256(b).hexdigest() for key, b in fixtures.items()},
+                        control_validation=control_checks, images=result)
+        tmp_path = None
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(mode="w", suffix=".tmp", dir=dest.parent, delete=False, encoding="utf-8") as f:
+                tmp_path = Path(f.name)
+                json.dump(document, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, dest)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+    except (OSError, json.JSONDecodeError, ValueError, KeyError, TypeError,
+            pefile.PEFormatError, struct.error, subprocess.SubprocessError) as exc:
+        p.exit(1, f"probe_roots: {exc}\n")
+
     for name, report in result.items():
         print(name, report["containers"], report["results"])
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

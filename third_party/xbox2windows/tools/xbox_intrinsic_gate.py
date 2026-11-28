@@ -46,45 +46,83 @@ def status_table(lowered=()):
     return status_of
 
 
-def decide(inventory, status_of=None):
-    """Refuse a module while it still calls xbox.*, whatever any adapter reports.
+def reaches_xbox(inventory):
+    """True when the module reaches an xbox.* symbol, by calling it or by holding it."""
+    return bool(inventory["calls"] or inventory.get("references"))
 
-    Every call blocks. `status_of` is advisory: it fills `advisory` on each blocking entry so a
-    report can show what an adapter claims, and the verdict ignores it.
+
+def decide(inventory, status_of=None):
+    """Refuse a module while it still calls or references xbox.*, whatever any adapter reports.
+
+    A call blocks, and so does every other form that keeps the symbol reachable: an alias, a
+    stored pointer, a bitcast, a global initializer or a call operand. Each blocking entry names
+    its form, so a refusal says how the module still reaches the builtin. The one exception is
+    `debug-only`: a symbol carried solely by a debug intrinsic's metadata operands is not
+    executable use, so it is reported under `debug_only` and does not block. `status_of` is
+    advisory: it fills `advisory` on each entry so a report can show what an adapter claims, and
+    the verdict ignores it.
     """
     status_of = status_of or default_status_of
-    blocking = []
-    for symbol in sorted(inventory["calls"]):
+    calls = inventory["calls"]
+    references = inventory.get("references") or {}
+    blocking_calls, blocking_references, debug_only = [], [], []
+    for symbol in sorted(set(calls) | set(references)):
         builtin = symbol[len(XBOX_PREFIX):] if symbol.startswith(XBOX_PREFIX) else symbol
         advisory, unblocks = status_of(builtin)
-        blocking.append({
+        entry = {
             "name": symbol,
             "builtin": builtin,
-            "sites": inventory["calls"][symbol],
             "status": UNRESOLVED,
             "unblocks": unblocks,
             "advisory": advisory,
-        })
+        }
+        if symbol in calls:
+            entry["form"] = "call"
+            entry["sites"] = calls[symbol]
+            blocking_calls.append(entry)
+            continue
+        executable = [kind for kind in references[symbol]["kinds"] if kind != "debug-only"]
+        if not executable:
+            debug_only.append(symbol)
+            continue
+        entry["form"] = ", ".join(executable)
+        entry["sites"] = references[symbol]["sites"]
+        blocking_references.append(entry)
+    blocking = blocking_calls + blocking_references
     verdict = REJECT if blocking else ALLOW
     names = [entry["name"] for entry in blocking]
     if verdict == REJECT:
-        message = f"REJECT: {len(names)} executable xbox.* call(s): {', '.join(names)}"
+        parts = []
+        if blocking_calls:
+            listed = ", ".join(f"{entry['name']} ({entry['form']})" for entry in blocking_calls)
+            parts.append(f"{len(blocking_calls)} executable xbox.* call(s): {listed}")
+        if blocking_references:
+            listed = ", ".join(f"{entry['name']} ({entry['form']})" for entry in blocking_references)
+            parts.append(f"{len(blocking_references)} executable xbox.* reference(s): {listed}")
+        message = "REJECT: " + "; ".join(parts)
         claimed = [entry["builtin"] for entry in blocking if entry["advisory"] == LOWERED]
         if claimed:
-            message += f" (advisory reports LOWERED for {', '.join(claimed)}; the module still calls them)"
+            message += (f" (advisory reports LOWERED for {', '.join(claimed)};"
+                        " the module still reaches them)")
     else:
         message = (
-            f"ALLOW: no executable xbox.* calls "
+            f"ALLOW: no executable xbox.* calls or references "
             f"(declarations={len(inventory['declarations'])}, metadata_only={len(inventory['metadata_only'])})"
         )
+        if debug_only:
+            message = message[:-1] + f"; debug-only use of {', '.join(debug_only)})"
     return {
         "verdict": verdict,
-        "reason": "executable-xbox-calls" if blocking else "no-executable-xbox-calls",
+        "reason": "executable-xbox-references" if blocking else "no-executable-xbox-references",
         "message": message,
-        "calls": inventory["calls"],
+        "calls": calls,
         "declarations": inventory["declarations"],
         "metadata_only": inventory["metadata_only"],
+        "references": references,
+        "debug_only": debug_only,
         "blocking": blocking,
+        "blocking_calls": blocking_calls,
+        "blocking_references": blocking_references,
         "reported_names": names,
         "checked": True,
     }
@@ -105,7 +143,11 @@ def not_checked(reason):
         "calls": {},
         "declarations": [],
         "metadata_only": [],
+        "references": {},
+        "debug_only": [],
         "blocking": [],
+        "blocking_calls": [],
+        "blocking_references": [],
         "reported_names": [],
     }
 
@@ -133,7 +175,7 @@ def gate_submission(decision, module_text, submit):
     return decision
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
     text = sub.add_parser("check-text", help="Gate a module given as disassembly text")
@@ -141,7 +183,7 @@ def main() -> int:
     shader = sub.add_parser("check", help="Gate a DXBC container through a validator probe")
     shader.add_argument("input", type=Path, help="DXBC container")
     shader.add_argument("--probe", type=Path, help="root_probe.exe path")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.command not in ("check-text", "check"):
         parser.print_help(sys.stderr)

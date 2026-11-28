@@ -1,5 +1,8 @@
 """Synthetic controls and DXC validator checks for tools/dxil_retarget.py."""
 
+from contextlib import redirect_stderr, redirect_stdout
+import hashlib
+import io
 import json
 from pathlib import Path
 import struct
@@ -14,6 +17,27 @@ import dxil_retarget as rt
 from resource_inventory import dxil_program, parts
 
 SKIP = 77
+
+
+def _run_cli(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run rt.main(argv) in-process with CPython SystemExit semantics."""
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = 0
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = rt.main(argv)
+            rc = 0 if result is None else int(result)
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            rc = 0
+        elif isinstance(code, int):
+            rc = code
+        else:
+            stderr.write(f"{code}\n")
+            rc = 1
+    return subprocess.CompletedProcess(argv, rc, stdout.getvalue(), stderr.getvalue())
 
 
 def _encode_synthetic_bitcode(*, triple: str, abbreviated_triple: bool, abbreviated_md_name: bool,
@@ -237,6 +261,37 @@ def check_pure_python_controls() -> None:
     _, _, _, new_st_bc = rt.unpack_dxil_program(out_secs[b"STAT"])
     assert rt.retarget_bitcode(new_st_bc)[1]["original_triple"] == "dxil-ms-dx"
 
+    status = {"triple": rt.DESKTOP_TRIPLE, "container_status": "0x00000000",
+              "module_status": "0x00000000"}
+    accepted = {"signed": True, "after": status, "gate": {"verdict": "ALLOW"}}
+    signed = rt.build_dxbc_container(list(out_secs.items()), digest=b"\x01" * 16)
+    with TemporaryDirectory() as directory:
+        catalogue = Path(directory) / "catalogue"
+        expected = catalogue / f"{hashlib.sha256(synth_dxbc).hexdigest()}.dxil"
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, accepted) == expected
+        assert expected.read_bytes() == signed
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, out_dxbc, accepted) is None
+        missing_root = rt.build_dxbc_container([(b"DXIL", out_secs[b"DXIL"])], digest=b"\x01" * 16)
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, missing_root, accepted) is None
+        rejected = {**accepted, "gate": {"verdict": "REJECT"}}
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, rejected) is None
+        failed = {**accepted, "after": {**status, "module_status": "0x80004005"}}
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, failed) is None
+        # Each remaining condition refuses on its own, with the same signed bytes otherwise accepted:
+        # an entry not marked signed, a module left on another triple and a failed container check.
+        for label, refused in (
+            ("unsigned entry", {**accepted, "signed": False}),
+            ("source triple", {**accepted, "after": {**status, "triple": rt.SOURCE_TRIPLE}}),
+            ("container status", {**accepted, "after": {**status, "container_status": "0x80aa0009"}}),
+        ):
+            assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, refused) is None, label
+        # Only compute programs are published. The program kind is the high 16 bits of the DXIL
+        # version word: (5 << 16) | 0x65 is cs_6_5, while 0x65 alone is ps_6_5 (kind 0).
+        pixel_secs = {**out_secs, b"DXIL": rt.pack_dxil_program(0x65, 0x105, new_bc)}
+        pixel = rt.build_dxbc_container(list(pixel_secs.items()), digest=b"\x01" * 16)
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, pixel, accepted) is None
+        assert list(catalogue.iterdir()) == [expected]
+
     kept_dxbc, kept_info = rt.retarget_container(synth_dxbc, clear_root_flags=False)
     assert kept_info["cleared_root_flags"] == "0x0"
     assert struct.unpack_from("<I", parts(kept_dxbc)[b"RTS0"], 20)[0] == 0x03000001
@@ -297,9 +352,9 @@ def check_pure_python_controls() -> None:
         in_file.write_bytes(synth_dxbc)
         cli_out = json.loads(subprocess.check_output([sys.executable, "-B", str(tool), str(in_file), str(out_file)]))
         assert cli_out["kind"] == "dxbc" and cli_out["signed"] is False and out_file.read_bytes() == out_dxbc
-        cli_bc = json.loads(subprocess.check_output(
-            [sys.executable, "-B", str(tool), str(in_file), str(bc_file), "--extract-module"]
-        ))
+        cli_bc_run = _run_cli([str(in_file), str(bc_file), "--extract-module"])
+        assert cli_bc_run.returncode == 0, cli_bc_run.stderr
+        cli_bc = json.loads(cli_bc_run.stdout)
         assert cli_bc["kind"] == "bitcode" and bc_file.read_bytes() == new_bc
 
         for bad_args in (
@@ -309,7 +364,7 @@ def check_pure_python_controls() -> None:
             [str(in_file), str(out_file), "--warp-only"],
             [str(bc_file), str(out_file), "--sign", "--probe", str(fake_probe)],
         ):
-            bad_run = subprocess.run([sys.executable, "-B", str(tool), *bad_args], capture_output=True)
+            bad_run = _run_cli(bad_args)
             assert bad_run.returncode != 0, f"Accepted invalid CLI arguments {bad_args}"
 
         # A damaged or missing input is reported as an error message, not a traceback.
@@ -319,12 +374,10 @@ def check_pure_python_controls() -> None:
             bad_in = tmp_dir / f"damaged-{label}.bin"
             bad_in.write_bytes(payload)
             bad_out = tmp_dir / f"damaged-{label}.out"
-            bad_run = subprocess.run([sys.executable, "-B", str(tool), str(bad_in), str(bad_out)],
-                                     capture_output=True, text=True)
+            bad_run = _run_cli([str(bad_in), str(bad_out)])
             assert bad_run.returncode == 1, (label, bad_run.returncode, bad_run.stderr)
             assert "Traceback" not in bad_run.stderr and not bad_out.exists(), (label, bad_run.stderr)
-        missing_run = subprocess.run([sys.executable, "-B", str(tool), str(tmp_dir / "missing.bin"),
-                                      str(tmp_dir / "missing.out")], capture_output=True, text=True)
+        missing_run = _run_cli([str(tmp_dir / "missing.bin"), str(tmp_dir / "missing.out")])
         assert missing_run.returncode == 1 and "Traceback" not in missing_run.stderr, missing_run.stderr
 
     # 5. Pure-Python controls for sign_container and check_compute_pso
@@ -454,7 +507,8 @@ define void @main() {
 
     # A metadata description that looks like a call still contains no instruction.
     inventory = xbox_intrinsic_inventory('!0 = !{!"call void @xbox.inventory_example("}')
-    assert inventory == dict(calls={}, declarations=[], metadata_only=["xbox.inventory_example"]), inventory
+    assert inventory == dict(calls={}, declarations=[], metadata_only=["xbox.inventory_example"],
+                            references={}), inventory
     inventory = xbox_intrinsic_inventory('  %"call result" = tail call i32 @"xbox.inventory_example"()')
     assert inventory["calls"] == {"xbox.inventory_example": 1}, inventory
 
@@ -468,7 +522,7 @@ define void @main() {
 !1 = !{!"__XBOX_ENABLE_WAVE32=1"}
 """
     inventory = xbox_intrinsic_inventory(named_metadata)
-    assert inventory == dict(calls={}, declarations=[], metadata_only=[]), inventory
+    assert inventory == dict(calls={}, declarations=[], metadata_only=[], references={}), inventory
 
     # (d) Ordinary module: dx.op calls and unrelated metadata report three empty groups.
     ordinary = """
@@ -484,7 +538,7 @@ define void @main() {
 !0 = !{i32 2, !"DXC version", !"1.8.2407"}
 """
     inventory = xbox_intrinsic_inventory(ordinary)
-    assert inventory == dict(calls={}, declarations=[], metadata_only=[]), inventory
+    assert inventory == dict(calls={}, declarations=[], metadata_only=[], references={}), inventory
 
     # 7. Submission gate: the final module is checked and a refused module is never submitted.
     import xbox_intrinsic_gate as gate
@@ -525,6 +579,133 @@ define void @main() {
     stub = RecordingSubmit()
     removed = gate.gate_submission(gate.check_text(declared), declared, stub)
     assert removed["verdict"] == gate.ALLOW and len(stub.batches) == 1, removed
+
+    # Every form that keeps an xbox.* symbol reachable blocks, and the refusal names the form.
+    alias_module = "@alias_bfi = alias i32 (i32), ptr @xbox.BFI\n"
+    store_module = ("define void @main() {\n"
+                    "  store ptr @xbox.global_store_dword_with_cache, ptr %slot\n"
+                    "  ret void\n}\n")
+    indirect_module = ("define void @main() {\n"
+                       "  %fp = bitcast ptr @xbox.foo to ptr\n"
+                       "  call void %fp(i32 1)\n"
+                       "  ret void\n}\n")
+    bitcast_call_module = ("define void @main() {\n"
+                           "  call void bitcast (void (i32)* @xbox.foo to void (i64)*)(i64 5)\n"
+                           "  ret void\n}\n")
+    global_initializer_module = "@table = global ptr @xbox.Med3_F32\n"
+    # A function pointer: the symbol goes into a global, the call goes through the loaded pointer.
+    function_pointer_module = ("@slot = global ptr null\n"
+                               "define void @main() {\n"
+                               "  store ptr @xbox.foo, ptr @slot\n"
+                               "  %fp = load ptr, ptr @slot\n"
+                               "  call void %fp(i32 1)\n"
+                               "  ret void\n}\n")
+    # An ordinary callee that receives the symbol as an argument — not a debug intrinsic.
+    call_operand_module = ("declare void @consume(ptr)\n"
+                           "define void @main() {\n"
+                           "  call void @consume(ptr @xbox.foo)\n"
+                           "  ret void\n}\n")
+    for label, module_text, form in (
+        ("alias", alias_module, "alias"),
+        ("store", store_module, "store"),
+        ("indirect call through a bitcast", indirect_module, "bitcast"),
+        ("function pointer in a global initializer", global_initializer_module, "global-initializer"),
+        ("function pointer in a slot", function_pointer_module, "store"),
+        ("call operand of an ordinary callee", call_operand_module, "call-operand"),
+        ("bitcast-spelled direct call", bitcast_call_module, "call"),
+    ):
+        stub = RecordingSubmit()
+        decision = gate.gate_submission(gate.check_text(module_text), module_text, stub)
+        assert decision["verdict"] == gate.REJECT, (label, decision)
+        assert stub.batches == [], (label, "a reachable symbol was submitted")
+        assert decision["blocking"][0]["form"] == form, (label, decision["blocking"])
+        assert form in decision["message"], (label, decision["message"])
+    # The bitcast-spelled call is a call site, not merely a reference.
+    assert gate.check_text(bitcast_call_module)["calls"] == {"xbox.foo": 1}, gate.check_text(bitcast_call_module)
+    # A referenced name is not metadata-only.
+    assert gate.check_text(alias_module)["metadata_only"] == [], gate.check_text(alias_module)
+
+    # A debug intrinsic carries the symbol only as metadata the runtime never reads: allowed.
+    debug_only_module = ("declare void @llvm.dbg.value(metadata, i64, metadata, metadata)\n"
+                         "define void @main() {\n"
+                         "  call void @llvm.dbg.value(metadata ptr @xbox.foo, i64 0,"
+                         " metadata !0, metadata !1)\n"
+                         "  ret void\n}\n"
+                         "!0 = !{}\n"
+                         "!1 = !{}\n")
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(debug_only_module), debug_only_module, stub)
+    assert decision["verdict"] == gate.ALLOW, decision
+    assert decision["calls"] == {} and decision["blocking"] == [], decision
+    assert decision["debug_only"] == ["xbox.foo"], decision
+    assert "debug-only" in decision["message"], decision["message"]
+    assert len(stub.batches) == 1, decision
+    # The same symbol stops being debug-only once an ordinary callee receives it.
+    assert gate.check_text(call_operand_module)["verdict"] == gate.REJECT
+
+    # Only the callee decides: an ordinary callee whose argument happens to mention a debug
+    # intrinsic is still an executable call, so the symbol must block.
+    trap_module = ("declare void @consume(ptr, ptr)\n"
+                   "define void @main() {\n"
+                   "  call void @consume(ptr @xbox.foo, ptr bitcast (void()* @llvm.dbg.value to i8*))\n"
+                   "  ret void\n}\n")
+    stub = RecordingSubmit()
+    decision = gate.gate_submission(gate.check_text(trap_module), trap_module, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert stub.batches == [], "a call mentioning a debug intrinsic was submitted"
+    assert decision["blocking_references"][0]["form"] == "call-operand", decision
+    assert decision["debug_only"] == [], decision
+
+    # The other debug intrinsics are debug-only uses as well.
+    for intrinsic, signature in (("llvm.dbg.declare", "metadata, metadata, metadata"),
+                                 ("llvm.dbg.assign", "metadata, metadata, metadata, metadata, metadata, metadata")):
+        module_text = (f"declare void @{intrinsic}({signature})\n"
+                       "define void @main() {\n"
+                       f"  call void @{intrinsic}(metadata ptr @xbox.foo, metadata !0, metadata !1"
+                       f"{', metadata !0, metadata !1, metadata !0' if 'assign' in intrinsic else ''})\n"
+                       "  ret void\n}\n"
+                       "!0 = !{}\n"
+                       "!1 = !{}\n")
+        stub = RecordingSubmit()
+        decision = gate.gate_submission(gate.check_text(module_text), module_text, stub)
+        assert decision["verdict"] == gate.ALLOW, (intrinsic, decision)
+        assert decision["debug_only"] == ["xbox.foo"], (intrinsic, decision)
+        assert len(stub.batches) == 1, (intrinsic, decision)
+
+    # sites counts executable uses only; a debug-only use is counted apart.
+    debug_inventory = xbox_intrinsic_inventory(debug_only_module)
+    assert debug_inventory["references"]["xbox.foo"]["sites"] == 0, debug_inventory
+    assert debug_inventory["references"]["xbox.foo"]["debug_sites"] == 1, debug_inventory
+    # The archive filter counts anything reachable, debug-only included: skipping is conservative.
+    assert gate.reaches_xbox(debug_inventory) is True, debug_inventory
+
+    # An advisory status cannot clear a reference the module still holds.
+    stub = RecordingSubmit()
+    claims = gate.status_table(["BFI"])
+    decision = gate.gate_submission(gate.check_text(alias_module, claims), alias_module, stub)
+    assert decision["verdict"] == gate.REJECT, decision
+    assert decision["blocking_references"][0]["advisory"] == gate.LOWERED, decision
+    assert stub.batches == [], "an advisory status cleared a reference"
+
+    # The same rule at the backend boundary: a reference-only inventory starts no probe process.
+    with patch.object(rt.subprocess, "run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["dev", "--compute-pso"], 0, b'{"warp_pso":"0x00000000"}\n', b"")
+        reference_only = rt.check_compute_pso(
+            Path("dev"), synth_dxbc,
+            intrinsics=dict(calls={}, declarations=[], metadata_only=[],
+                            references={"xbox.BFI": {"sites": 1, "kinds": ["alias"]}}))
+        assert mock_run.call_count == 0, "a reference-only module started a submission"
+        assert reference_only["gate"]["verdict"] == gate.REJECT, reference_only
+        assert reference_only["gate"]["blocking_references"][0]["form"] == "alias", reference_only
+
+    # --only-without-xbox-calls keeps one meaning: no form reaches an xbox.* symbol.
+    reached = xbox_intrinsic_inventory(alias_module)
+    assert gate.reaches_xbox(reached) is True, reached
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(called)) is True
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(declared)) is False
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(metadata)) is False
+    assert gate.reaches_xbox(xbox_intrinsic_inventory(ordinary)) is False
 
     # A metadata string that spells a call is not an instruction: it must not refuse the module.
     spelled_call = '!0 = !{!"call void @xbox.text()"}'
@@ -584,16 +765,13 @@ define void @main() {
     assert stub.batches == [], "an unexamined module reached the submission callable"
 
     # --pso-probe without --probe: no disassembly, so the CLI records NOT_CHECKED and submits nothing.
-    tool = Path(__file__).resolve().parents[1] / "tools" / "dxil_retarget.py"
     with TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         in_file = tmp_dir / "in.dxbc"
         out_file = tmp_dir / "out.dxbc"
         absent_probe = tmp_dir / "absent_probe.exe"
         in_file.write_bytes(synth_dxbc)
-        ungated = subprocess.run(
-            [sys.executable, "-B", str(tool), str(in_file), str(out_file), "--pso-probe", str(absent_probe)],
-            capture_output=True, text=True)
+        ungated = _run_cli([str(in_file), str(out_file), "--pso-probe", str(absent_probe)])
         assert ungated.returncode == 0, ungated.stderr
         pso = json.loads(ungated.stdout)["pso"]
         assert pso["gate"]["verdict"] == gate.NOT_CHECKED, pso
@@ -604,8 +782,51 @@ define void @main() {
     print("submission gate controls: executable call refused with 0 submissions; declared only, "
           "metadata only and ordinary modules submit once; an advisory LOWERED status still refuses "
           "while the call remains and clears once the call is gone; missing inventory starts 0 probe "
-          "processes; a metadata string that spells a call and a ';' inside a metadata string still "
+          "processes; an alias, a store, an indirect call through a bitcast, a function pointer in a "
+          "global initializer, a function pointer in a slot, a call operand of an ordinary callee and a "
+          "bitcast-spelled direct call each refused with their form named in 0 submissions, with calls "
+          "and references listed apart; a debug intrinsic that only carries the symbol as metadata is "
+          "allowed and reported as debug-only, and so are llvm.dbg.declare and llvm.dbg.assign; an "
+          "ordinary call that merely mentions a debug intrinsic in an argument still blocks as "
+          "call-operand; an advisory LOWERED status clears neither a call nor a reference; sites counts "
+          "executable uses only while the archive filter treats every reachable form as reaching an "
+          "intrinsic; a metadata string that spells a call and a ';' inside a metadata string still "
           "pass; without --probe the CLI records NOT_CHECKED and submits nothing")
+    # Malformed streams end in ValueError, not in a hang or an interpreter error.
+    # An array count larger than the bits left in the stream is refused, even when its elements
+    # are zero bits wide.
+    huge = rt.BitWriter()
+    huge.write_vbr(1 << 22, 6)
+    huge.align32()
+    for element in ((rt.ENC_FIXED, 0), (rt.ENC_FIXED, 8), (rt.ENC_VBR, 6), (rt.ENC_CHAR6, None)):
+        try:
+            rt._read_abbrev_record(rt.BitReader(huge.finish()), [("LIT", 4), (rt.ENC_ARRAY, None), element])
+        except ValueError as exc:
+            assert "Array length" in str(exc), exc
+        else:
+            raise AssertionError(f"array of {element} accepted a count beyond the stream")
+    # A legitimate zero-width array that fits the stream still reads.
+    small = rt.BitWriter()
+    small.write_vbr(3, 6)
+    small.align32()
+    code, values, _ = rt._read_abbrev_record(rt.BitReader(small.finish()), [("LIT", 4), (rt.ENC_ARRAY, None), (rt.ENC_FIXED, 0)])
+    assert (code, values) == (4, [0, 0, 0]), (code, values)
+
+    # Blocks nested beyond the limit are refused; blocks at the limit still parse.
+    def nested(levels: int) -> bytes:
+        items: list = []
+        for _ in range(levels):
+            items = [("BLOCK", rt.MODULE_BLOCK_ID, 3, items)]
+        return rt.serialize_bitcode(items)
+
+    rt.parse_bitcode(nested(rt.MAX_BLOCK_DEPTH))
+    try:
+        rt.parse_bitcode(nested(rt.MAX_BLOCK_DEPTH + 1))
+    except ValueError as exc:
+        assert "nest deeper" in str(exc), exc
+    else:
+        raise AssertionError("bitcode nested beyond the limit was accepted")
+
     print("pure-python dxil_retarget controls: ok")
 
 
